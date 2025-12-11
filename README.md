@@ -1,3 +1,8 @@
+
+<img width="1536" height="1024" alt="ChatGPT Image 11 Ara 2025 19_57_39" src="https://github.com/user-attachments/assets/91f3d05b-7038-4b6b-8aaf-3770ebfabe65" />
+
+
+
 # SmartAttend – Face + Emotion Attendance App
 
 SmartAttend is a desktop app that takes **attendance using face recognition and emotion detection**.
