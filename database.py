@@ -1,35 +1,34 @@
-# database.py
 import os
 import sqlite3
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import datetime
+from typing import List, Dict, Any
 
 import numpy as np
 
+# Path to the SQLite database file
 DB_PATH = os.path.join(os.path.dirname(__file__), "smart_attend.db")
 
 
-def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
-    return sqlite3.connect(db_path)
-
-
+# ─────────────────────────────────────────
+# DB INIT
+# ─────────────────────────────────────────
 def init_db(db_path: str = DB_PATH) -> None:
-    """Create tables if they do not exist."""
-    conn = _connect(db_path)
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
+    # Students table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS students (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            code TEXT UNIQUE NOT NULL,
-            emoji TEXT DEFAULT '🙂',
+            name TEXT NOT NULL UNIQUE,
+            emoji TEXT,
             created_at TEXT NOT NULL
         )
         """
     )
 
+    # Face embeddings table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS faces (
@@ -37,21 +36,21 @@ def init_db(db_path: str = DB_PATH) -> None:
             student_id INTEGER NOT NULL,
             embedding BLOB NOT NULL,
             created_at TEXT NOT NULL,
-            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
+            FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
         )
         """
     )
 
+    # Attendance table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id INTEGER,
-            name TEXT,
-            status TEXT,
+            student_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
             emotion TEXT,
-            mode TEXT,
-            created_at TEXT NOT NULL
+            emoji TEXT,
+            FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
         )
         """
     )
@@ -60,107 +59,167 @@ def init_db(db_path: str = DB_PATH) -> None:
     conn.close()
 
 
-def add_student(name: str, code: str, emoji: str = "🙂", db_path: str = DB_PATH) -> int:
-    conn = _connect(db_path)
+# ─────────────────────────────────────────
+# HELPERS FOR EMBEDDINGS
+# ─────────────────────────────────────────
+def _embedding_to_blob(embedding: np.ndarray) -> bytes:
+    return embedding.astype(np.float32).tobytes()
+
+
+def _blob_to_embedding(blob: bytes) -> np.ndarray:
+    arr = np.frombuffer(blob, dtype=np.float32)
+    return arr
+
+
+# ─────────────────────────────────────────
+# STUDENTS / FACES
+# ─────────────────────────────────────────
+def add_student(name: str, emoji: str, db_path: str = DB_PATH) -> int:
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
+
+    created_at = datetime.datetime.now().isoformat(timespec="seconds")
+
     cur.execute(
-        "INSERT INTO students (name, code, emoji, created_at) VALUES (?, ?, ?, ?)",
-        (name, code, emoji, now),
+        """
+        INSERT INTO students (name, emoji, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (name, emoji, created_at),
     )
+
     student_id = cur.lastrowid
     conn.commit()
     conn.close()
     return student_id
 
 
-def add_face_embedding(student_id: int, embedding: np.ndarray, db_path: str = DB_PATH) -> None:
-    conn = _connect(db_path)
+def add_face_embedding(student_id: int, embedding: np.ndarray, db_path: str = DB_PATH) -> int:
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    # store as binary
+
+    created_at = datetime.datetime.now().isoformat(timespec="seconds")
+    blob = _embedding_to_blob(embedding)
+
     cur.execute(
-        "INSERT INTO faces (student_id, embedding, created_at) VALUES (?, ?, ?)",
-        (student_id, embedding.astype("float32").tobytes(), now),
+        """
+        INSERT INTO faces (student_id, embedding, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (student_id, blob, created_at),
     )
+
+    face_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return face_id
 
 
 def get_all_embeddings(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
-    """Return list of dicts: {student_id, name, code, emoji, embedding}."""
-    conn = _connect(db_path)
+    """
+    Returns a list of:
+    {
+        "face_id": int,
+        "student_id": int,
+        "name": str,
+        "emoji": str,
+        "embedding": np.ndarray
+    }
+    """
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
+
     cur.execute(
         """
-        SELECT s.id, s.name, s.code, s.emoji, f.embedding
-        FROM students s
-        JOIN faces f ON s.id = f.student_id
+        SELECT 
+            f.id,
+            f.student_id,
+            f.embedding,
+            s.name,
+            s.emoji
+        FROM faces f
+        JOIN students s ON f.student_id = s.id
         """
     )
+
     rows = cur.fetchall()
     conn.close()
 
-    result: List[Dict[str, Any]] = []
-    for r in rows:
-        student_id, name, code, emoji, emb_blob = r
-        emb_array = np.frombuffer(emb_blob, dtype="float32")
-        result.append(
+    results: List[Dict[str, Any]] = []
+    for face_id, student_id, emb_blob, name, emoji in rows:
+        emb = _blob_to_embedding(emb_blob)
+        results.append(
             {
+                "face_id": face_id,
                 "student_id": student_id,
                 "name": name,
-                "code": code,
-                "emoji": emoji,
-                "embedding": emb_array,
+                "emoji": emoji or "🙂",
+                "embedding": emb,
             }
         )
-    return result
+
+    return results
 
 
+# ─────────────────────────────────────────
+# ATTENDANCE
+# ─────────────────────────────────────────
 def log_attendance(
-    student_id: Optional[int],
-    name: str,
-    status: str,
+    student_id: int,
     emotion: str,
-    mode: str,
+    emoji: str,
     db_path: str = DB_PATH,
-) -> None:
-    conn = _connect(db_path)
+) -> int:
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
+
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+
     cur.execute(
         """
-        INSERT INTO attendance (student_id, name, status, emotion, mode, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO attendance (student_id, timestamp, emotion, emoji)
+        VALUES (?, ?, ?, ?)
         """,
-        (student_id, name, status, emotion, mode, now),
+        (student_id, ts, emotion, emoji),
     )
+
+    att_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return att_id
 
 
-def get_recent_attendance(limit: int = 20, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
-    conn = _connect(db_path)
+def get_recent_attendance(limit: int = 30, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
+
     cur.execute(
         """
-        SELECT name, status, emotion, mode, created_at
-        FROM attendance
-        ORDER BY created_at DESC
+        SELECT 
+            a.timestamp,
+            s.name,
+            s.emoji,
+            a.emotion
+        FROM attendance a
+        JOIN students s ON a.student_id = s.id
+        ORDER BY a.timestamp DESC
         LIMIT ?
         """,
         (limit,),
     )
+
     rows = cur.fetchall()
     conn.close()
 
-    return [
-        {
-            "name": r[0],
-            "status": r[1],
-            "emotion": r[2],
-            "mode": r[3],
-            "created_at": r[4],
-        }
-        for r in rows
-    ]
+    results: List[Dict[str, Any]] = []
+    for ts, name, emoji, emotion in rows:
+        results.append(
+            {
+                "timestamp": ts,
+                "name": name,
+                "emoji": emoji or "",
+                "emotion": emotion or "",
+            }
+        )
+
+    return results

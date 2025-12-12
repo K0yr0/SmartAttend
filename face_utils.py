@@ -1,254 +1,325 @@
 # face_utils.py
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-from typing import Any, Dict, List, Tuple
 
-# --- Haar cascades ---
-FACE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+import mediapipe as mp
+
+
+# -----------------------------
+# MediaPipe singletons
+# -----------------------------
+_mp_fd = mp.solutions.face_detection
+_mp_fm = mp.solutions.face_mesh
+
+_face_detector = _mp_fd.FaceDetection(model_selection=0, min_detection_confidence=0.6)
+
+_face_mesh = _mp_fm.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=5,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
 )
 
-EYE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_eye.xml"
-)
-
-SMILE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_smile.xml"
-)
+# simple temporal smoothing (per "track id" built from bbox)
+_EMO_SMOOTH: Dict[str, Dict[str, Any]] = {}  # {"key": {"emo": str, "ttl": int}}
 
 
-def detect_faces(gray_frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """Detect faces on a gray frame. Returns list of (x, y, w, h)."""
-    faces = FACE_CASCADE.detectMultiScale(
-        gray_frame,
-        scaleFactor=1.2,
-        minNeighbors=5,
-        minSize=(60, 60),
-    )
-    return list(faces)
+# -----------------------------
+# Utilities
+# -----------------------------
+def draw_box(
+    img_bgr: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    color: Tuple[int, int, int],
+    label: str = "",
+) -> None:
+    cv2.rectangle(img_bgr, (x, y), (x + w, y + h), color, 2)
+    if label:
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(img_bgr, (x, y - th - 10), (x + tw + 8, y), color, -1)
+        cv2.putText(
+            img_bgr,
+            label,
+            (x + 4, y - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
 
 
-def compute_embedding(face_img: np.ndarray) -> np.ndarray:
-    """
-    Simple embedding: resize to 32x32 gray, standardize, then L2-normalize.
-    No dlib / deep model needed.
-    """
-    if len(face_img.shape) == 3:
-        face_gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-    else:
-        face_gray = face_img
+def _safe_int(v: float, lo: int, hi: int) -> int:
+    return int(max(lo, min(hi, v)))
 
-    resized = cv2.resize(face_gray, (32, 32))  # 32x32 -> 1024 dims
-    vec = resized.flatten().astype("float32")
 
-    # standardize
-    vec = vec - float(np.mean(vec))
-    std = float(np.std(vec)) + 1e-6
-    vec = vec / std
+def _lm_to_px(lm, w: int, h: int) -> Tuple[int, int]:
+    return int(lm.x * w), int(lm.y * h)
 
-    # L2 normalize
-    norm = float(np.linalg.norm(vec)) + 1e-6
-    vec = vec / norm
+
+def _dist(p1: Tuple[int, int], p2: Tuple[int, int]) -> float:
+    return float(np.hypot(p1[0] - p2[0], p1[1] - p2[1]))
+
+
+# -----------------------------
+# Face embedding (NO dlib)
+# -----------------------------
+def compute_embedding(face_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
+    gray = gray.astype(np.float32) / 255.0
+
+    dct = cv2.dct(gray)
+    dct_block = dct[:16, :16].flatten()  # 256
+
+    small = cv2.resize(gray, (24, 24), interpolation=cv2.INTER_AREA).flatten()  # 576
+
+    vec = np.concatenate([dct_block, small], axis=0).astype(np.float32)
+    vec /= (np.linalg.norm(vec) + 1e-8)
     return vec
 
 
-def match_embedding(
-    emb: np.ndarray,
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-8) * (np.linalg.norm(b) + 1e-8)))
+
+
+def match_face(
+    embedding: np.ndarray,
     known_faces: List[Dict[str, Any]],
-    threshold: float = 0.68,  # slightly loosened
-) -> Tuple[bool, Dict[str, Any] | None, float]:
+    similarity_threshold: float = 0.78,
+) -> Tuple[bool, Optional[Dict[str, Any]], float]:
+    best = None
+    best_sim = -1.0
+
+    for k in known_faces:
+        emb_k = k.get("embedding")
+        if emb_k is None:
+            continue
+
+        if isinstance(emb_k, (list, tuple)):
+            emb_k = np.array(emb_k, dtype=np.float32)
+        elif isinstance(emb_k, (bytes, bytearray)):
+            emb_k = np.frombuffer(emb_k, dtype=np.float32)
+
+        if not isinstance(emb_k, np.ndarray) or emb_k.size == 0:
+            continue
+
+        sim = _cosine_similarity(embedding, emb_k.astype(np.float32))
+        if sim > best_sim:
+            best_sim = sim
+            best = k
+
+    if best is not None and best_sim >= similarity_threshold:
+        return True, best, best_sim
+    return False, None, best_sim
+
+
+# -----------------------------
+# Emotion (more sensitive)
+# -----------------------------
+def _emotion_from_landmarks(face_landmarks, img_w: int, img_h: int) -> str:
     """
-    Compare emb to all known embeddings. Uses cosine similarity.
-    If best similarity >= threshold, return (True, best_face, best_sim).
-    Otherwise (False, None, best_sim).
+    More sensitive heuristics to get Happy/Sad/Angry instead of Neutral.
+    Uses:
+      - smile curvature (mouth corners vs lips center)
+      - mouth openness
+      - brow tension (brows lower & closer)
     """
-    if not known_faces:
-        return False, None, 0.0
+    lms = face_landmarks.landmark
+    n = len(lms)
 
-    sims: List[float] = []
-    for f in known_faces:
-        kemb = f["embedding"]
-        sim = float(np.dot(emb, kemb))  # embeddings are normalized
-        sims.append(sim)
+    def get(idx: int) -> Optional[Tuple[int, int]]:
+        if 0 <= idx < n:
+            return _lm_to_px(lms[idx], img_w, img_h)
+        return None
 
-    best_idx = int(np.argmax(sims))
-    best_sim = sims[best_idx]
-    if best_sim >= threshold:
-        return True, known_faces[best_idx], best_sim
-    else:
-        return False, None, best_sim
+    # stable FaceMesh ids
+    p_mL = get(61)    # mouth left
+    p_mR = get(291)   # mouth right
+    p_u = get(13)     # upper lip
+    p_l = get(14)     # lower lip
+    p_n = get(1)      # nose ref
+    p_eL = get(33)    # left eye outer
+    p_eR = get(263)   # right eye outer
+
+    # brows
+    p_bL = get(65)
+    p_bR = get(295)
+    # inner brows (tension indicator)
+    p_biL = get(55)
+    p_biR = get(285)
+
+    needed = [p_mL, p_mR, p_u, p_l, p_n, p_eL, p_eR, p_bL, p_bR, p_biL, p_biR]
+    if any(p is None for p in needed):
+        return "Neutral"
+
+    face_w = max(_dist(p_eL, p_eR), 1.0)
+
+    mouth_w = _dist(p_mL, p_mR)
+    mouth_open = _dist(p_u, p_l)
+
+    # smile curvature: compare mouth corners y vs mouth center y
+    mouth_center_y = (p_u[1] + p_l[1]) / 2.0
+    corners_y = (p_mL[1] + p_mR[1]) / 2.0
+    smile_curve = (mouth_center_y - corners_y) / face_w
+    # >0 means corners are higher than center (smile)
+
+    # corners relative to nose as extra signal
+    corner_lift = (p_n[1] - corners_y) / face_w
+
+    # brow drop relative to nose
+    brow_y = (p_bL[1] + p_bR[1]) / 2.0
+    brow_drop = (brow_y - p_n[1]) / face_w
+
+    # brow inner distance (smaller => tension, often angry)
+    brow_inner_dist = _dist(p_biL, p_biR) / face_w
+
+    # normalized
+    mouth_w_r = mouth_w / face_w
+    mouth_open_r = mouth_open / face_w
+
+    # ---- more permissive thresholds ----
+    # Happy: visible smile curve OR lifted corners + wide mouth
+    if (smile_curve > 0.020 and mouth_w_r > 0.36) or (corner_lift > 0.030 and mouth_w_r > 0.40):
+        return "Happy"
+
+    # Angry: brows lower + inner brows closer + mouth not too open
+    if brow_drop > 0.10 and brow_inner_dist < 0.38 and mouth_open_r < 0.10:
+        return "Angry"
+
+    # Sad: corners droop / no smile + mouth not wide
+    if (smile_curve < 0.005 and corner_lift < 0.018 and mouth_w_r < 0.40) or (corner_lift < 0.012):
+        return "Sad"
+
+    return "Neutral"
 
 
-def _rule_based_emotion(face_img: np.ndarray) -> str:
+def _smooth_emotion(key: str, raw: str) -> str:
     """
-    Lightweight emotion heuristic using:
-    - brightness & contrast
-    - upper vs lower face brightness (mouth/eyebrow hint)
-    - smile & eye Haar cascades
-
-    Returns label with emoji, e.g. "Happy 😊".
+    Prevents flicker and helps 'Neutral-only' issues:
+    - if we already had an emotion recently, keep it briefly unless strong change.
     """
-    if len(face_img.shape) == 3:
-        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = face_img
+    # decay ttl for all
+    dead = []
+    for k, v in _EMO_SMOOTH.items():
+        v["ttl"] -= 1
+        if v["ttl"] <= 0:
+            dead.append(k)
+    for k in dead:
+        _EMO_SMOOTH.pop(k, None)
 
-    gray = cv2.resize(gray, (120, 120))
-    brightness = float(np.mean(gray))
-    contrast = float(np.std(gray))
+    prev = _EMO_SMOOTH.get(key)
+    if prev is None:
+        _EMO_SMOOTH[key] = {"emo": raw, "ttl": 8}
+        return raw
 
-    upper = gray[:60, :]
-    lower = gray[60:, :]
+    # If raw is Neutral but we had something else, keep old a bit
+    if raw == "Neutral" and prev["emo"] in ("Happy", "Sad", "Angry"):
+        prev["ttl"] = 6
+        return prev["emo"]
 
-    # positive -> lower part brighter / more open
-    mouth_open = float(np.mean(lower) - np.mean(upper))
-
-    # --- Detect eyes & smile using cascades ---
-
-    eyes_roi = upper
-    eyes = EYE_CASCADE.detectMultiScale(
-        eyes_roi,
-        scaleFactor=1.1,
-        minNeighbors=8,
-        minSize=(12, 12),
-    )
-
-    smile_roi = lower
-    smiles = SMILE_CASCADE.detectMultiScale(
-        smile_roi,
-        scaleFactor=1.5,
-        minNeighbors=12,
-        minSize=(15, 15),
-    )
-
-    num_eyes = len(eyes)
-    num_smiles = len(smiles)
-
-    # ---- Heuristic rules ----
-    # Priority order: Happy > Surprised > Angry > Sad > Fear > Disgust > Neutral
-
-    # 1) Happy: clear smile, or bright face with open mouth
-    if num_smiles > 0 or (mouth_open > 1.5 and brightness > 65):
-        return "Happy 😊"
-
-    # 2) Surprised: wide eyes + high contrast + mouth_open
-    if num_eyes >= 2 and contrast > 55 and mouth_open > 1:
-        return "Surprised 😮"
-
-    # 3) Angry: make this easier to trigger (frowny, tense face)
-    #   - mouth_open slightly negative (lower part darker)
-    #   - decent contrast
-    #   - not super dark overall
-    if mouth_open < -0.4 and contrast > 40 and 50 < brightness < 170:
-        return "Angry 😠"
-
-    # 4) Sad: darker / low-energy face, not too much mouth movement
-    if brightness < 115 and contrast < 55 and mouth_open < 0.5:
-        return "Sad 😢"
-
-    # 5) Fear: high contrast, slightly dark, mouth a bit open
-    if contrast > 60 and brightness < 120 and mouth_open > 0.5:
-        return "Fear 😱"
-
-    # 6) Disgust: keep this quite rare
-    if brightness < 70 and mouth_open < -8:
-        return "Disgust 🤢"
-
-    # 7) Default
-    return "Neutral 😐"
+    # If change, accept it but stabilize
+    prev["emo"] = raw
+    prev["ttl"] = 8
+    return raw
 
 
+# -----------------------------
+# Main API used by app.py
+# -----------------------------
 def detect_faces_and_emotions(
     frame_bgr: np.ndarray,
     known_faces: List[Dict[str, Any]],
     mode: str = "single",
 ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-    """
-    Detect faces, calculate embeddings & match to known faces.
-    Also estimate emotion heuristically.
+    try:
+        img_h, img_w = frame_bgr.shape[:2]
+        processed = frame_bgr.copy()
 
-    Returns:
-        processed_frame_bgr, detections
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        detections: list of dicts
-            {
-              "x", "y", "w", "h",
-              "name",
-              "emoji",
-              "label_text",   # e.g. "Kayra 😊 • Happy"
-              "emotion",      # e.g. "Happy 😊"
-              "student_id",   # or None
-              "registered",   # bool
-            }
-    """
-    frame_out = frame_bgr.copy()
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = detect_faces(gray)
+        fd_res = _face_detector.process(rgb)
+        bboxes: List[Tuple[int, int, int, int]] = []
 
-    detections: List[Dict[str, Any]] = []
+        if fd_res.detections:
+            for det in fd_res.detections:
+                r = det.location_data.relative_bounding_box
+                x = _safe_int(r.xmin * img_w, 0, img_w - 1)
+                y = _safe_int(r.ymin * img_h, 0, img_h - 1)
+                w = _safe_int(r.width * img_w, 1, img_w - x)
+                h = _safe_int(r.height * img_h, 1, img_h - y)
+                bboxes.append((x, y, w, h))
 
-    if not len(faces):
-        return frame_out, detections
+        if not bboxes:
+            return processed, []
 
-    # For "single" mode, pick the largest face; for "classroom", keep all.
-    if mode == "single":
-        areas = [w * h for (x, y, w, h) in faces]
-        idx = int(np.argmax(areas))
-        faces_to_use = [faces[idx]]
-    else:
-        faces_to_use = faces
+        if mode == "single":
+            bboxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+            bboxes = bboxes[:1]
 
-    for (x, y, w, h) in faces_to_use:
-        x, y, w, h = int(x), int(y), int(w), int(h)
-        face_crop = frame_bgr[max(y, 0) : y + h, max(x, 0) : x + w]
-        if face_crop.size == 0:
-            continue
+        fm_res = _face_mesh.process(rgb)
+        mesh_faces = fm_res.multi_face_landmarks or []
 
-        emb = compute_embedding(face_crop)
-        registered, best_face, sim = match_embedding(emb, known_faces)
+        detections: List[Dict[str, Any]] = []
 
-        emotion = _rule_based_emotion(face_crop)
+        for (x, y, w, h) in bboxes:
+            face_crop = frame_bgr[y : y + h, x : x + w]
+            if face_crop.size == 0:
+                continue
 
-        if registered and best_face is not None:
-            name = best_face["name"]
-            emoji = best_face.get("emoji") or "🙂"
-            student_id = best_face["student_id"]
-            label_text = f"{name} {emoji}  •  {emotion}  ({sim:.2f})"
-            color = (0, 200, 0)  # green box
-        else:
-            name = "Unregistered"
-            emoji = "❔"
-            student_id = None
-            label_text = f"Unregistered {emoji}  •  {emotion}"
-            color = (0, 0, 255)  # red box
+            emb = compute_embedding(face_crop)
+            is_reg, best, sim = match_face(emb, known_faces, similarity_threshold=0.78)
 
-        # Draw rectangle & label
-        cv2.rectangle(frame_out, (x, y), (x + w, y + h), color, 2)
-        cv2.rectangle(frame_out, (x, y - 24), (x + w, y), color, -1)
-        cv2.putText(
-            frame_out,
-            label_text,
-            (x + 4, y - 6),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+            if is_reg and best is not None:
+                name = str(best.get("name", "Registered"))
+                emoji = str(best.get("emoji", "🙂"))
+                student_id = best.get("student_id", None)
+                registered = True
+                box_color = (60, 220, 120)  # green
+                label = f"{name} {emoji}"
+            else:
+                name = "Unregistered"
+                emoji = "❔"
+                student_id = None
+                registered = False
+                box_color = (80, 80, 255)  # red
+                label = "Unregistered ❌"
 
-        detections.append(
-            {
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-                "name": name,
-                "emoji": emoji,
-                "label_text": label_text,
-                "emotion": emotion,
-                "student_id": student_id,
-                "registered": registered,
-            }
-        )
+            # Emotion
+            raw_emotion = "Neutral"
+            if len(mesh_faces) >= 1:
+                raw_emotion = _emotion_from_landmarks(mesh_faces[0], img_w, img_h)
 
-    return frame_out, detections
+            # Smooth using bbox key
+            key = f"{x//20}-{y//20}-{w//20}-{h//20}"
+            emotion = _smooth_emotion(key, raw_emotion)
+
+            draw_box(processed, x, y, w, h, box_color, f"{label} • {emotion}")
+
+            detections.append(
+                {
+                    "x": int(x),
+                    "y": int(y),
+                    "w": int(w),
+                    "h": int(h),
+                    "registered": registered,
+                    "student_id": student_id,
+                    "name": name if registered else "Unregistered",
+                    "emoji": emoji if registered else "❔",
+                    "emotion": emotion,
+                    "similarity": float(sim),
+                }
+            )
+
+        return processed, detections
+
+    except Exception as e:
+        print(f"Error in detect_faces_and_emotions: {e}")
+        return frame_bgr, []

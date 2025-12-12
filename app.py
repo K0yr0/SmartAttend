@@ -31,7 +31,8 @@ ctk.set_default_color_theme("blue")
 
 
 def send_attendance_to_n8n(payload: Dict[str, Any]) -> None:
-    """Best-effort POST to n8n (non-blocking from UI)."""
+    """Best-effort POST to n8n (runs in background thread)."""
+
     def _worker():
         try:
             requests.post(WEBHOOK_URL, json=payload, timeout=5)
@@ -43,7 +44,6 @@ def send_attendance_to_n8n(payload: Dict[str, Any]) -> None:
 
 
 class SmartAttendApp(ctk.CTk):
-
     def __init__(self) -> None:
         super().__init__()
 
@@ -321,13 +321,16 @@ class SmartAttendApp(ctk.CTk):
 
     def _show_blank_camera(self) -> None:
         blank = Image.new("RGB", (CAM_WIDTH, CAM_HEIGHT), (12, 12, 16))
-        draw = Image.new("RGB", (CAM_WIDTH, CAM_HEIGHT), (12, 12, 16))
         img_tk = ImageTk.PhotoImage(blank)
         self.camera_label.configure(image=img_tk)
         self.camera_label.image = img_tk
-        self.camera_label.configure(text="Camera stopped", font=ctk.CTkFont(size=16))
+        self.camera_label.configure(
+            text="Camera stopped",
+            font=ctk.CTkFont(size=16),
+        )
 
     def _update_camera(self) -> None:
+        """Grab one frame, run detection, update UI, and schedule next frame."""
         if not self.camera_running or self.cap is None:
             return
 
@@ -342,19 +345,30 @@ class SmartAttendApp(ctk.CTk):
 
         self.last_frame = frame.copy()
 
-        processed, detections = detect_faces_and_emotions(frame, self.known_faces, self.mode)
+        # --- SAFE detection call ---
+        try:
+            processed, detections = detect_faces_and_emotions(
+                frame, self.known_faces, self.mode
+            )
+        except Exception as e:
+            print("Error in detect_faces_and_emotions:", e)
+            processed, detections = frame, []
+
         self.last_detections = detections
 
         # Update info labels from first detection if any
         if detections:
             d0 = detections[0]
-            if d0["registered"]:
+            if d0.get("registered"):
                 self.name_info_label.configure(
-                    text=f"Student: {d0['name']} {d0['emoji']}",
+                    text=f"Student: {d0.get('name', 'Unknown')} {d0.get('emoji', '')}",
                 )
             else:
                 self.name_info_label.configure(text="Student: Unregistered ❔")
-            self.emotion_info_label.configure(text=f"Emotion: {d0['emotion']}")
+
+            self.emotion_info_label.configure(
+                text=f"Emotion: {d0.get('emotion', 'Unknown')}"
+            )
         else:
             self.name_info_label.configure(text="Student: —")
             self.emotion_info_label.configure(text="Emotion: —")
@@ -380,8 +394,8 @@ class SmartAttendApp(ctk.CTk):
         self.camera_label.configure(image=img_tk, text="")
         self.camera_label.image = img_tk
 
-        # Schedule next frame
-        self.after(40, self._update_camera)  # ~25 fps
+        # Schedule next frame (~25 fps)
+        self.after(40, self._update_camera)
 
     # ---------- Register ----------
     def _on_register_student(self) -> None:
@@ -418,7 +432,7 @@ class SmartAttendApp(ctk.CTk):
         # We already asked face_utils to only use largest face in "single" mode
         d = detections[0]
         x, y, w, h = d["x"], d["y"], d["w"], d["h"]
-        face_crop = frame[max(y, 0) : y + h, max(x, 0) : x + w]
+        face_crop = frame[max(y, 0): y + h, max(x, 0): x + w]
 
         from face_utils import compute_embedding  # local import to avoid circular
 
@@ -523,7 +537,10 @@ class SmartAttendApp(ctk.CTk):
         self.recent_box.configure(state="normal")
         self.recent_box.delete("1.0", "end")
         for r in rows:
-            line = f"{r['created_at']}  •  {r['name']}  •  {r['status']}  •  {r['emotion']}\n"
+            line = (
+                f"{r['created_at']}  •  {r['name']}  •  "
+                f"{r['status']}  •  {r['emotion']}\n"
+            )
             self.recent_box.insert("end", line)
         self.recent_box.configure(state="disabled")
 
